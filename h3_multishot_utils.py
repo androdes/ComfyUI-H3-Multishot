@@ -543,6 +543,38 @@ def _parse_script(text):
     return shots
 
 
+def _snap_frames(f, default):
+    """Onto H3's 17k+5 grid, rounding up; anything unreadable becomes `default`."""
+    try:
+        f = int(f)
+    except Exception:
+        return int(default)
+    f = max(5, f)
+    return f if f % 17 == 5 else 5 + 17 * ((f - 5 + 16) // 17)
+
+
+def _parse_frames(text, n, default):
+    """Per-shot lengths, when the JSON script carries them:
+    {"prompts": [...], "frames": [243, 124, ...]} (ints at 24 fps, snapped to
+    the 17k+5 grid). A plain --- script, or a JSON without "frames", gives
+    every shot `default` (the frames_per_shot widget). Shorter lists are
+    padded with their last value; longer ones are cut to the shot count.
+    (h3studio fork: one length per shot instead of one for the whole chain.)"""
+    text = (text or "").strip()
+    out = []
+    if text.startswith("{"):
+        data, _ = _repair_json(text)
+        if isinstance(data, dict) and isinstance(data.get("frames"), list):
+            out = [_snap_frames(v, default) for v in data["frames"]]
+    while len(out) < n:
+        out.append(out[-1] if out else _snap_frames(default, default))
+    out = out[:n]
+    if len(set(out)) > 1:
+        print("[H3Multishot] per-shot lengths: %s frames"
+              % ", ".join(str(f) for f in out), flush=True)
+    return out
+
+
 class H3ScriptSplit:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2375,6 +2407,8 @@ class H3MultishotSampler:
                   f"prompt (script had fewer prompts than shot_count).",
                   flush=True)
             shots.append(shots[-1])
+        frames_list = _parse_frames(script, n, frames_per_shot)
+        frames_per_shot = max(frames_list)
 
         if sigmas is not None and len(sigmas) > 1:
             # a supplied schedule wins: some turbo LoRAs only converge on the
@@ -2429,14 +2463,15 @@ class H3MultishotSampler:
             print("[H3Multishot] I2V: shot 1 starts from the supplied image.",
                   flush=True)
         for si, prompt in enumerate(shots):
+            shot_frames = frames_list[si]
             print(f"[H3Multishot] shot {si + 1}/{n} "
-                  f"({frames_per_shot}f @ {width}x{height})...", flush=True)
+                  f"({shot_frames}f @ {width}x{height})...", flush=True)
             if two_pass_upscale:
                 latent, frame_count = mmh3._empty_av_latent(
-                    w1, h1, frames_per_shot)
+                    w1, h1, shot_frames)
             else:
                 latent, frame_count = mmh3._empty_av_latent(
-                    width, height, frames_per_shot)
+                    width, height, shot_frames)
             images, keyframes, keyframes_hi = [], [], []
             if prev_last is not None:
                 anchor = prev_last[:1]
@@ -3028,6 +3063,17 @@ def _ref2va_summary(n_image, n_audio, n_video, n_sub, n_chain=0,
     return "summary:\n" + " ".join(s)
 
 
+def _already_sectioned(body):
+    """True when a shot prompt already carries the official Ref2VA sections
+    (subject_definitions / summary / retention_analysis / detailed_description
+    ...), as a studio that numbers its own <Picture n> / <Audio n> writes them.
+    Such a prompt is sent verbatim: wrapping it in a second set of sections
+    put two subject_definitions in one conditioning and buried the writer's
+    own labels under generic ones (h3studio fork)."""
+    b = (body or "").lstrip()
+    return b.startswith("subject_definitions:") or "\ndetailed_description:" in b
+
+
 def _compose_ref2va(defs, summary, retention, body):
     """The six official sections in the guide's order, body in the middle.
 
@@ -3041,6 +3087,8 @@ def _compose_ref2va(defs, summary, retention, body):
     source for that section yet. non_diegetic_music: N/A is the guide's own
     value for "no score", and nothing in the conditioning said so before.
     """
+    if _already_sectioned(body):
+        return body.strip()
     return "\n\n".join([defs, summary, retention,
                         "detailed_description:\n" + body.strip(),
                         "non_diegetic_music: N/A"])
@@ -4121,6 +4169,8 @@ class H3MultishotMemorySampler:
             shots = shots[:n]
         while len(shots) < n:
             shots.append(shots[-1])
+        frames_list = _parse_frames(script, n, frames_per_shot)
+        frames_per_shot = max(frames_list)
 
         if sigmas is not None and len(sigmas) > 1:
             # a supplied schedule wins: some turbo LoRAs only converge on the
@@ -4362,7 +4412,7 @@ class H3MultishotMemorySampler:
                     upscale_model)
             _ow, _oh = int(round(width * _f)), int(round(height * _f))
             _per = _ow * _oh * 3 * 2 / 2**30          # fp16 on the host
-            _tot = _per * frames_per_shot * max(1, len(shots))
+            _tot = _per * sum(frames_list)
             print("[H3Memory] upscale will produce %dx%d (%.1fx): %.0f MB per "
                   "frame, %.1f GB per shot, %.1f GB for %d shot(s)%s"
                   % (_ow, _oh, _f, _per * 1024, _per * frames_per_shot, _tot,
@@ -4374,7 +4424,7 @@ class H3MultishotMemorySampler:
                       "in system RAM until the master is joined, so this dies "
                       "at the join after every shot has been paid for. Set "
                       "output_scale to %.2f or lower, or turn the upscaler off."
-                      % max(1.0, (_ram * 0.7 / (frames_per_shot * max(1, len(shots))
+                      % max(1.0, (_ram * 0.7 / (sum(frames_list)
                                                 * width * height * 3 * 2 / 2**30))
                             ** 0.5), flush=True)
         sr = None
@@ -4633,15 +4683,16 @@ class H3MultishotMemorySampler:
               f"checkpoint.", flush=True)
 
         for si, prompt in enumerate(shots):
+            shot_frames = frames_list[si]
             if two_pass_upscale:
                 latent, frame_count = mmh3._empty_av_latent(
-                    _tp_w1, _tp_h1, frames_per_shot)
+                    _tp_w1, _tp_h1, shot_frames)
                 _p1v, _p1n = _tp_tr.extract_tensor(latent["samples"])
                 _tp_lat_h1 = int(_p1v[0].shape[-2])
                 _tp_lat_w1 = int(_p1v[0].shape[-1])
             else:
                 latent, frame_count = mmh3._empty_av_latent(width, height,
-                                                            frames_per_shot)
+                                                            shot_frames)
             ref_items, ref_blocks = [], []
             kf_vision = []     # first_frame mode: images -> vision tokens
 
@@ -4893,15 +4944,15 @@ class H3MultishotMemorySampler:
                 # encode loop below, so join_anchor_noise applies too.
                 kf_img = mmh3._resize(_house_frame, width, height, "disabled")
                 keyframes.append(
-                    {"resolved_frame_index": frames_per_shot - 1,
+                    {"resolved_frame_index": shot_frames - 1,
                      "image": kf_img})
-                if frames_per_shot > 21:
+                if shot_frames > 21:
                     keyframes.append(
-                        {"resolved_frame_index": frames_per_shot - 13,
+                        {"resolved_frame_index": shot_frames - 13,
                          "image": kf_img})
 
             print("[H3Memory] shot %d/%d (%df @ %dx%d) | bank %s%s"
-                  % (si + 1, n, frames_per_shot, width, height, bank.describe(),
+                  % (si + 1, n, shot_frames, width, height, bank.describe(),
                      " + identity ref" if (start_image is not None
                                            and anchor_frames > 0) else ""),
                   flush=True)
@@ -5492,7 +5543,7 @@ class H3MultishotMemorySampler:
                     # this shot's time-slice of the spine: shots advance by
                     # (frames_per_shot - trim) in output time, and the trim
                     # depends on the continuity mode
-                    _a0 = int(round(si * (frames_per_shot - _TRIM)
+                    _a0 = int(round((sum(frames_list[:si]) - si * _TRIM)
                                     / 24.0 * 40.0))
                     _a0 = max(0, min(_a0, max(0, _spine.shape[-1] - 1)))
                     _spine_seg = _spine[..., _a0:_a0 + _ashape[-1]]
