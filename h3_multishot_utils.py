@@ -553,6 +553,31 @@ def _snap_frames(f, default):
     return f if f % 17 == 5 else 5 + 17 * ((f - 5 + 16) // 17)
 
 
+def _parse_voices(text, n):
+    """Which voice references ride in each shot, when the JSON script says:
+    {"prompts": [...], "voices": [[1, 2], [1], [], [2, 1]]} - per shot, the
+    1-based wiring indices (voice_ref = 1, voice_ref_2 = 2, voice_ref_3 = 3)
+    in the order they take the shot's <Audio n> slots. Without it every wired
+    voice rides in every shot (the classic behaviour). A voice the model is
+    handed is a voice it tends to play: a shot where nobody speaks should
+    carry none. (h3studio fork.) Returns None, or a list of n lists."""
+    text = (text or "").strip()
+    if not text.startswith("{"):
+        return None
+    data, _ = _repair_json(text)
+    if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
+        return None
+    out = []
+    for v in data["voices"][:n]:
+        try:
+            out.append([int(x) for x in (v or []) if int(x) in (1, 2, 3)])
+        except Exception:
+            out.append([1, 2, 3])
+    while len(out) < n:
+        out.append([1, 2, 3])
+    return out
+
+
 def _parse_frames(text, n, default):
     """Per-shot lengths, when the JSON script carries them:
     {"prompts": [...], "frames": [243, 124, ...]} (ints at 24 fps, snapped to
@@ -4171,6 +4196,9 @@ class H3MultishotMemorySampler:
             shots.append(shots[-1])
         frames_list = _parse_frames(script, n, frames_per_shot)
         frames_per_shot = max(frames_list)
+        voices_list = _parse_voices(script, n)
+        if voices_list is not None:
+            print("[H3Memory] per-shot voices: %s" % voices_list, flush=True)
 
         if sigmas is not None and len(sigmas) > 1:
             # a supplied schedule wins: some turbo LoRAs only converge on the
@@ -4703,7 +4731,14 @@ class H3MultishotMemorySampler:
             for _it, _bl in zip(ref_image_items, ref_image_blocks):
                 ref_items.append(_it)
                 ref_blocks.append(_bl)
-            for _vb in voice_blocks:
+            # per-shot voices (h3studio fork): only the voices the script lists
+            # for this shot ride in it, in the order listed; else all of them.
+            if voices_list is not None:
+                _vwant = [w for w in voices_list[si] if w in voice_subjects]
+                _vpick = [voice_blocks[voice_subjects.index(w)] for w in _vwant]
+            else:
+                _vpick = voice_blocks
+            for _vb in _vpick:
                 ref_items.append({"type": "audio"})
                 ref_blocks.append(_vb)
 
@@ -5045,7 +5080,9 @@ class H3MultishotMemorySampler:
             # ~4-minute DiT<->TE swap at every later boundary
             # (measured 2026-08-23 on the Zara chain).
             if (si == 1 and not _cond_cache and int(memory_frames or 0) == 0
-                    and ref_items and len(shots) > 2):
+                    and ref_items and len(shots) > 2
+                    and (voices_list is None
+                         or all(v == voices_list[1] for v in voices_list[1:]))):
                 try:
                     for _j in range(si + 1, len(shots)):
                         _pj = shots[_j] if _j < len(shots) else shots[-1]
