@@ -5079,11 +5079,16 @@ class H3MultishotMemorySampler:
             # encode them ALL in this one TE session instead of paying the
             # ~4-minute DiT<->TE swap at every later boundary
             # (measured 2026-08-23 on the Zara chain).
+            # Per-shot voices (h3studio fork) do not stop the batch: a later
+            # shot's items are this shot's pictures and pinned clip with its
+            # own voice slots in between, and the voice items carry no data -
+            # only their count and place matter to the tokenizer. Skipping the
+            # batch cost a DiT<->TE swap at every boundary (~4 min each).
             if (si == 1 and not _cond_cache and int(memory_frames or 0) == 0
-                    and ref_items and len(shots) > 2
-                    and (voices_list is None
-                         or all(v == voices_list[1] for v in voices_list[1:]))):
+                    and ref_items and len(shots) > 2):
                 try:
+                    _n_img_items = len(ref_image_items)
+                    _n_cur_v = len(_vpick)
                     for _j in range(si + 1, len(shots)):
                         _pj = shots[_j] if _j < len(shots) else shots[-1]
                         if _sd:
@@ -5092,8 +5097,15 @@ class H3MultishotMemorySampler:
                             else:
                                 _pj = _compose_ref2va(_parts[0], _parts[1],
                                                       _parts[2], _pj)
+                        _ri_j = ref_items
+                        if voices_list is not None:
+                            _vw_j = [w for w in voices_list[_j]
+                                     if w in voice_subjects]
+                            _ri_j = (ref_items[:_n_img_items]
+                                     + [{"type": "audio"}] * len(_vw_j)
+                                     + ref_items[_n_img_items + _n_cur_v:])
                         _tk_j = clip.tokenize(_pj,
-                                              minimax_ref_items=ref_items)
+                                              minimax_ref_items=_ri_j)
                         _cond_cache[_j] = \
                             clip.encode_from_tokens_scheduled(_tk_j)
                     print("[H3Memory] TE batch: pre-encoded %d remaining "
