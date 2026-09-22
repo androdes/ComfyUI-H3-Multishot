@@ -3498,7 +3498,19 @@ def _cond_key(prompt, ref_items, kf_vision, clip):
     import torch
     h = hashlib.sha1()
     h.update(repr(prompt).encode())
-    h.update(str(id(getattr(clip, "patcher", clip))).encode())
+    try:
+        _cm = getattr(clip, "cond_stage_model", None)
+        h.update(type(_cm).__name__.encode())
+        _pt = getattr(clip, "patcher", None)
+        _sd = getattr(getattr(_pt, "model", None), "state_dict", None)
+        if callable(_sd):
+            # first weight tensor's shape + a few values: tells two encoder
+            # files apart without hashing 15 GB
+            for _k, _v in _sd().items():
+                h.update(("%s%s" % (_k, tuple(_v.shape))).encode())
+                break
+    except Exception:
+        pass
     for it in ref_items or []:
         h.update(("|" + str(it.get("type"))).encode())
         for kk in sorted(it.keys()):
