@@ -6008,8 +6008,12 @@ class H3MultishotMemorySampler:
                 else:
                     imgs = _cc_apply(imgs, _cc_mu, _cc_cov)
                     print("[H3Memory] colour levelled to house", flush=True)
+            # The refreshed pin is for the NEXT shot: the last shot of a take
+            # has none, and re-encoding its tail (a video-VAE encode, ~10 s
+            # at 768 on a 5090) bought nothing. A one-shot take skips it whole.
             if (continuity == "context_pin"
-                    and chain_gain_control in ("refresh_pin", "level_pin")):
+                    and chain_gain_control in ("refresh_pin", "level_pin")
+                    and si < n - 1):
                 # REFRESH THE CARRIER IN THE PIXEL DOMAIN. Every earlier lever
                 # either cleaned shipped frames after the loop (flatten,
                 # master_normalize) or softened the pin through a latent
