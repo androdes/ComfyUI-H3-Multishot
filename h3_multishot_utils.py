@@ -5149,6 +5149,18 @@ class H3MultishotMemorySampler:
             # eventually fails (hostbuf_file_reader_read). Costs nothing: the
             # DiT is reloaded every shot regardless.
             _clk.mark("prep")
+            if live_glimpse and si == 0:
+                # Order matters on one card: the DiT goes in first and whole,
+                # the encoder takes what is left and streams the rest. The
+                # other way round the DiT streams 9 GB per step (measured
+                # 8.8 s instead of 1.1 s for six steps at 512).
+                try:
+                    import comfy.model_management as _mmL
+                    _mmL.load_models_gpu([model])
+                except Exception as _le:
+                    print("[H3Memory] live: DiT-first load skipped (%s)"
+                          % _le, flush=True)
+                _clk.mark("dit_first")
             if si > 0 and not live_glimpse:
                 try:
                     import comfy.model_management as _mm2
@@ -5959,6 +5971,17 @@ class H3MultishotMemorySampler:
                 except Exception as _lu_e:
                     print("[H3Memory] H3 latent upscale FAILED (%s) - "
                           "base-res decode kept" % _lu_e, flush=True)
+                    imgs = video_vae.decode(lat)
+            elif live_glimpse:
+                # Draft frames from the 9 MB tiny decoder: the glimpse graph
+                # reads video_latents through H3TAEDecode anyway, so the
+                # full video VAE (1.8 s and 5 GB) has nothing to add here.
+                try:
+                    from .h3_tae_decode import H3TAEDecode as _TAE
+                    imgs = _TAE().decode({"samples": lat}, "taeh3.safetensors")[0]
+                except Exception as _te_e:
+                    print("[H3Memory] live: tiny decode unavailable (%s) - "
+                          "video VAE used" % _te_e, flush=True)
                     imgs = video_vae.decode(lat)
             else:
                 imgs = video_vae.decode(lat)
