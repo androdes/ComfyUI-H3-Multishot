@@ -11,6 +11,10 @@ graph without erroring.
 """
 import json
 import re
+import os
+import time
+import hashlib
+import collections
 
 
 
@@ -3426,7 +3430,132 @@ class _H3ChainBank:
         return f"{len(self.frames())} slot(s) [{f} pinned + {len(self.frames()) - f} recent]"
 
 
+# ---------------------------------------------------------------------------
+# Live glimpse support (h3studio fork, 2026-09-22)
+#
+# A glimpse is a tiny, few-step take made while the user is still typing. Its
+# fixed cost was never the sampling: it was the two model swaps per run
+# (15 GB text encoder in, 20 GB DiT out, then back) and re-encoding the same
+# reference pictures every time. Three things attack that:
+#   * _StageClock   - per-stage timings, printed and appended to a log file,
+#                     so the cost is measured rather than guessed;
+#   * _H3_COND_LRU  - process-wide conditioning cache keyed by prompt + refs:
+#                     a re-seed or a re-run of the same sentence never
+#                     touches the text encoder;
+#   * _H3_REF_LRU   - process-wide reference-latent cache keyed by pixels.
+# With live_glimpse=True the node also stops evicting the text encoder
+# before the DiT and lets ComfyUI keep both resident when they fit.
+# ---------------------------------------------------------------------------
+_H3_TIMING_LOG = os.environ.get("H3_TIMING_LOG") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "h3-timing.log")
+
+
+class _StageClock:
+    def __init__(self, tag):
+        self.tag = tag
+        self.t0 = self.t = time.perf_counter()
+        self.rows = []
+
+    def mark(self, name):
+        now = time.perf_counter()
+        self.rows.append((name, now - self.t))
+        self.t = now
+
+    def dump(self, extra=""):
+        total = time.perf_counter() - self.t0
+        body = " | ".join("%s %.2fs" % r for r in self.rows)
+        line = "[H3Memory] timing (%s%s): total %.2fs | %s" % (
+            self.tag, (" " + extra) if extra else "", total, body)
+        print(line, flush=True)
+        try:
+            with open(_H3_TIMING_LOG, "a") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+        except Exception:
+            pass
+
+
+_H3_COND_LRU = collections.OrderedDict()
+_H3_COND_LRU_MAX = int(os.environ.get("H3_COND_CACHE", "48"))
+_H3_REF_LRU = collections.OrderedDict()
+_H3_REF_LRU_MAX = 32
+
+
+def _tensor_key(t):
+    try:
+        import torch
+        a = t.detach().to("cpu", copy=False).contiguous()
+        if a.dtype not in (torch.float32, torch.uint8):
+            a = a.float()
+        h = hashlib.sha1()
+        h.update(str(tuple(a.shape)).encode())
+        h.update(a.view(-1).numpy().tobytes())
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _cond_key(prompt, ref_items, kf_vision, clip):
+    import torch
+    h = hashlib.sha1()
+    h.update(repr(prompt).encode())
+    h.update(str(id(getattr(clip, "patcher", clip))).encode())
+    for it in ref_items or []:
+        h.update(("|" + str(it.get("type"))).encode())
+        for kk in sorted(it.keys()):
+            if kk == "type":
+                continue
+            v = it[kk]
+            if torch.is_tensor(v):
+                k = _tensor_key(v)
+                if k is None:
+                    return None
+                h.update(("%s=%s" % (kk, k)).encode())
+            elif isinstance(v, (str, int, float, bool)) or v is None:
+                h.update(("%s=%r" % (kk, v)).encode())
+            else:
+                return None
+    for im in kf_vision or []:
+        k = _tensor_key(im) if torch.is_tensor(im) else None
+        if k is None:
+            return None
+        h.update(k.encode())
+    return h.hexdigest()
+
+
+def _lru_get(lru, key):
+    if key is None or key not in lru:
+        return None
+    lru.move_to_end(key)
+    return lru[key]
+
+
+def _lru_put(lru, key, value, cap):
+    if key is None:
+        return
+    lru[key] = value
+    lru.move_to_end(key)
+    while len(lru) > cap:
+        lru.popitem(last=False)
+
+
+def _cached_vae_encode(video_vae, px, live):
+    """video_vae.encode with a pixel-keyed cache when live is on."""
+    if not live:
+        return video_vae.encode(px)
+    k = _tensor_key(px)
+    z = _lru_get(_H3_REF_LRU, k)
+    if z is not None:
+        return z
+    z = video_vae.encode(px)
+    try:
+        _lru_put(_H3_REF_LRU, k, z.detach().clone(), _H3_REF_LRU_MAX)
+    except Exception:
+        pass
+    return z
+
+
 class H3MultishotMemorySampler:
+
     """Multishot with a MEMORY BANK - a structural port of JoyEcho multishot.
 
     There is no keyframe here. Shots are not continued pixel-wise from their
@@ -3502,6 +3631,13 @@ class H3MultishotMemorySampler:
                            "1 and lets the bank carry it after that; keep this "
                            "at 0 or 1)."}),
         }, "optional": {
+            "live_glimpse": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Preview mode for tiny few-step takes: keeps the "
+                           "text encoder resident next to the DiT instead of "
+                           "swapping them, and reuses conditioning and "
+                           "reference latents across runs. Off for real "
+                           "takes."}),
             "start_image": ("IMAGE", {
                 "tooltip": "Optional identity reference image. NOT a first "
                            "frame - this node has no keyframe."}),
@@ -4157,7 +4293,8 @@ class H3MultishotMemorySampler:
             pin_noise_ramp=False, auto_chunk_ffn=False,
             sampler_2="(off)", sampler_2_at=0.40,
             voice_ref_2=None, voice_ref_3=None,
-            prompt=None, extra_pnginfo=None):
+            prompt=None, extra_pnginfo=None, live_glimpse=False):
+        _clk = _StageClock("live" if live_glimpse else "take")
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
         # the API graph is gone and the streamed master was tagged with the
@@ -4755,7 +4892,8 @@ class H3MultishotMemorySampler:
                 ref_items.append({"type": "image", "data": rz})
                 ref_blocks.append({"kind": "image", "latent_h": th // 16,
                                    "latent_w": tw // 16,
-                                   "latent": video_vae.encode(rz)})
+                                   "latent": _cached_vae_encode(
+                                       video_vae, rz, live_glimpse)})
 
             # bank slots -> video_audio references, built the way core does.
             # first_frame mode runs on an fl2va checkpoint, which has no
@@ -4998,7 +5136,8 @@ class H3MultishotMemorySampler:
             # beside it - ComfyUI streams the encoder off disk and the reader
             # eventually fails (hostbuf_file_reader_read). Costs nothing: the
             # DiT is reloaded every shot regardless.
-            if si > 0:
+            _clk.mark("prep")
+            if si > 0 and not live_glimpse:
                 try:
                     import comfy.model_management as _mm2
                     _d2 = _mm2.get_torch_device()
@@ -5067,12 +5206,22 @@ class H3MultishotMemorySampler:
                 tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
             else:
                 tokens = clip.tokenize(prompt)
+            _lk = (_cond_key(prompt, ref_items, kf_vision, clip)
+                   if live_glimpse else None)
+            _lhit = _lru_get(_H3_COND_LRU, _lk)
             if si in _cond_cache:
                 cond = _cond_cache.pop(si)
                 print("[H3Memory] TE batch: shot %d conditioning served "
                       "from cache - no DiT<->TE swap" % (si + 1), flush=True)
+            elif _lhit is not None:
+                cond = _lhit
+                print("[H3Memory] live: conditioning served from the "
+                      "process cache - text encoder not touched", flush=True)
             else:
                 cond = clip.encode_from_tokens_scheduled(tokens)
+                if _lk is not None:
+                    _lru_put(_H3_COND_LRU, _lk, cond, _H3_COND_LRU_MAX)
+            _clk.mark("text_encode" if _lhit is None else "cond_cache")
             # TE swap killer: with a frozen bank (memory_frames=0) every
             # remaining shot's multimodal items are identical after shot 2's
             # are built (fixed refs + shot-1 voice anchor + pinned clip), so
@@ -5427,7 +5576,14 @@ class H3MultishotMemorySampler:
             # issue #8: separate TE device -> nothing to reclaim, keep it hot
             _te_dev = getattr(clip.patcher, "load_device", None)
             _dit_dev = getattr(model, "load_device", None)
-            if (_te_dev is not None and _dit_dev is not None
+            if live_glimpse:
+                # Nothing is evicted by hand: ComfyUI keeps the encoder next
+                # to the DiT when they fit, and the next glimpse's encode
+                # then costs a forward pass instead of a 15 GB reload.
+                if si == 0:
+                    print("[H3Memory] live: text encoder kept resident, "
+                          "no eviction before the DiT", flush=True)
+            elif (_te_dev is not None and _dit_dev is not None
                     and str(_te_dev) != str(_dit_dev)):
                 if si == 0:
                     print(f"[H3Memory] TE on {_te_dev}, DiT on {_dit_dev} - "
@@ -5532,6 +5688,7 @@ class H3MultishotMemorySampler:
                 except Exception:
                     pass
 
+            _clk.mark("dit_prep")
             guider = ncs.BasicGuider().get_guider(model, cond)[0]
             guider_hi = (ncs.BasicGuider().get_guider(model, cond_hi)[0]
                          if two_pass_upscale else None)
@@ -5757,6 +5914,7 @@ class H3MultishotMemorySampler:
                         noise, guider, sampler, sigmas, latent)
             finally:
                 _auto_measure_end(_mb, model, steps=steps)
+            _clk.mark("sample")
 
             lat = out["samples"]
             if continuity == "context_pin":
@@ -5792,6 +5950,7 @@ class H3MultishotMemorySampler:
                     imgs = video_vae.decode(lat)
             else:
                 imgs = video_vae.decode(lat)
+            _clk.mark("decode")
             if imgs.ndim == 5:
                 imgs = imgs.reshape(-1, imgs.shape[-3], imgs.shape[-2],
                                     imgs.shape[-1])
@@ -6465,6 +6624,8 @@ class H3MultishotMemorySampler:
             print(f"[H3Memory] done (streamed): {n} shots -> {_mpath}. "
                   "master_frames is a 1-frame placeholder; wire master_path.",
                   flush=True)
+            _clk.mark("finish")
+            _clk.dump("%d shots %dx%d %df %dst" % (n, width, height, frames_per_shot, steps))
             return (_ph, {"waveform": waveform, "sample_rate": sr}, n,
                     _lat_v, _lat_a, int(_cp_trim), _mpath)
 
@@ -6489,6 +6650,8 @@ class H3MultishotMemorySampler:
             del _p
         print(f"[H3Memory] done: {n} shots, {master.shape[0]} frames "
               f"(~{master.shape[0] / 24.0:.1f}s).", flush=True)
+        _clk.mark("finish")
+        _clk.dump("%d shots %dx%d %df %dst" % (n, width, height, frames_per_shot, steps))
         return (master, {"waveform": waveform, "sample_rate": sr}, n,
                 _lat_v, _lat_a, int(_cp_trim), "")
 
