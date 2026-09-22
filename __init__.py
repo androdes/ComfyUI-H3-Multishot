@@ -45,6 +45,7 @@ for _m in ("h3_keyframes",       # keyframe anchors
            "h3_tae_decode",     # 9 MB draft decode for seed hunts
            "h3_speed_boosters",  # switch panel for optional accelerators
            "h3_attention_kernel",  # H3AttentionKernel: sage3 / int8 / flash per model
+           "h3_save_video_fast",   # H3SaveVideoFast: NVENC H.264 write, x264 fallback
            "h3_extend",          # H3ExtendTake: windows from a take length
            "h3_retake",          # H3Retake: redo one time window of a finished clip
            "ltx25_multishot",
