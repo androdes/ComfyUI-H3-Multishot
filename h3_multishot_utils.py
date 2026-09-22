@@ -6578,6 +6578,7 @@ class H3MultishotMemorySampler:
                 frames_parts.append(imgs.cpu().half())
             audio_parts.append((wav if wav.ndim == 3 else wav.unsqueeze(0)).cpu())
 
+        _clk.mark("shot_tail")
         if color_level == "scene" and len(frames_parts) > 1:
             # SCENE-WIDE match: ONE reference for the whole piece, applied
             # once at the end. The per-shot mode matched each shot to a
@@ -6667,12 +6668,14 @@ class H3MultishotMemorySampler:
             return (_ph, {"waveform": waveform, "sample_rate": sr}, n,
                     _lat_v, _lat_a, int(_cp_trim), _mpath)
 
+        _clk.mark("audio_xfade")
         if master_normalize != "off":
             frames_parts, _mn_msg = _mn_normalize(frames_parts, master_normalize)
             if _mn_msg:
                 print("[H3Memory] master normalize (%s): %s"
                       % (master_normalize, _mn_msg), flush=True)
 
+        _clk.mark("normalize")
         # Assemble in place. torch.cat allocated a second full timeline
         # while the first was still alive - 2x peak, and a 33.8 GB contiguous
         # request that a 64 GB box cannot satisfy. Same bytes, one buffer.
@@ -6686,6 +6689,7 @@ class H3MultishotMemorySampler:
             _o += int(_p.shape[0])
             frames_parts[_i] = None
             del _p
+        _clk.mark("assemble")
         print(f"[H3Memory] done: {n} shots, {master.shape[0]} frames "
               f"(~{master.shape[0] / 24.0:.1f}s).", flush=True)
         _clk.mark("finish")
