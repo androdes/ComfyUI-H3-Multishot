@@ -3580,6 +3580,21 @@ def _cond_key(prompt, ref_items, kf_vision, clip):
     return h.hexdigest()
 
 
+def _cond_to(cond, device):
+    """A conditioning list moved between devices, tensors inside dicts too."""
+    import torch
+    out = []
+    for item in cond:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            t, meta = item
+            t2 = t.to(device) if torch.is_tensor(t) else t
+            m2 = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in meta.items()} if isinstance(meta, dict) else meta
+            out.append([t2, m2])
+        else:
+            out.append(item)
+    return out
+
+
 def _lru_get(lru, key):
     if key is None or key not in lru:
         return None
@@ -5279,9 +5294,17 @@ class H3MultishotMemorySampler:
                 tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
             else:
                 tokens = clip.tokenize(prompt)
-            _lk = (_cond_key(prompt, ref_items, kf_vision, clip)
-                   if live_glimpse else None)
+            # Same words, same pictures, same encoder: the same conditioning.
+            # Kept in host RAM for every run, not only glimpses - a retake of
+            # a shot (new seed) skips the encoder and its ~6 s per shot.
+            _lk = _cond_key(prompt, ref_items, kf_vision, clip)
             _lhit = _lru_get(_H3_COND_LRU, _lk)
+            if _lhit is not None:
+                try:
+                    _lhit = _cond_to(_lhit, getattr(model, "load_device", None)
+                                     or _mm.get_torch_device())
+                except Exception:
+                    _lhit = None
             if si in _cond_cache:
                 cond = _cond_cache.pop(si)
                 print("[H3Memory] TE batch: shot %d conditioning served "
@@ -5293,7 +5316,11 @@ class H3MultishotMemorySampler:
             else:
                 cond = clip.encode_from_tokens_scheduled(tokens)
                 if _lk is not None:
-                    _lru_put(_H3_COND_LRU, _lk, cond, _H3_COND_LRU_MAX)
+                    try:
+                        _lru_put(_H3_COND_LRU, _lk, _cond_to(cond, "cpu"),
+                                 _H3_COND_LRU_MAX)
+                    except Exception:
+                        pass
             _clk.mark("text_encode" if _lhit is None else "cond_cache")
             # TE swap killer: with a frozen bank (memory_frames=0) every
             # remaining shot's multimodal items are identical after shot 2's
