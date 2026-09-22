@@ -1911,7 +1911,12 @@ def _cg_flatten(imgs, target, block=8, max_sigma=1.6):
     if n == 0 or target <= 0:
         return imgs, 0.0
     idx = list(range(0, n, block))
-    sig = _cg_sigma_batch(imgs[idx], target, max_sigma)
+    # The decoded frames live in host RAM; the search and the blur run on the
+    # card and come back (a 3x3 laplacian over 768 x 768 x 1000 passes on the
+    # CPU was the 15 s, not the maths).
+    _dev = (torch.device("cuda") if torch.cuda.is_available()
+            else imgs.device)
+    sig = _cg_sigma_batch(imgs[idx].to(_dev), target, max_sigma)
     # smooth (moving average of 3) so sigma cannot jump between blocks
     sm = []
     for j in range(len(sig)):
@@ -1923,7 +1928,8 @@ def _cg_flatten(imgs, target, block=8, max_sigma=1.6):
     for j, i in enumerate(idx):
         s = sm[j]
         if s > 0.02:
-            out[i:i + block] = _cg_gauss(imgs[i:i + block], s)
+            out[i:i + block] = _cg_gauss(imgs[i:i + block].to(_dev), s).to(
+                imgs.device, imgs.dtype)
     return out, (sum(sm) / len(sm))
 
 
