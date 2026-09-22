@@ -5156,7 +5156,10 @@ class H3MultishotMemorySampler:
                 # 8.8 s instead of 1.1 s for six steps at 512).
                 try:
                     import comfy.model_management as _mmL
-                    _mmL.load_models_gpu([model])
+                    try:
+                        _mmL.load_models_gpu([model], force_full_load=True)
+                    except TypeError:
+                        _mmL.load_models_gpu([model])
                 except Exception as _le:
                     print("[H3Memory] live: DiT-first load skipped (%s)"
                           % _le, flush=True)
