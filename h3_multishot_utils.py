@@ -6245,6 +6245,7 @@ class H3MultishotMemorySampler:
             wav = aud["waveform"]
             _clk.mark("audio_decode")
 
+            _clk.mark("audio_decode2")
             if audio_tone_control:
                 # the audio twin of chain flatten: EQ-match every later
                 # shot's long-term spectrum to shot 1's settled tail
@@ -6302,6 +6303,7 @@ class H3MultishotMemorySampler:
                         if _sig > 0:
                             imgs = _cg_gauss(imgs, _sig)
 
+            _clk.mark("chain_gain")
             if continuity == "first_frame" and si > 0 and last_tail is not None:
                 # did the model actually START on the handed-over frame?
                 _m0 = float((imgs[0].detach().cpu().float()
@@ -6402,6 +6404,7 @@ class H3MultishotMemorySampler:
                 print("[H3Memory] self-anchor: shot 1's voice (%.1fs) is now "
                       "<Audio 1> for the remaining %d shot(s)."
                       % (_aw.shape[-1] / sr, n - 1), flush=True)
+            _clk.mark("pins_fx")
             # store this shot as a bank slot: centre clip + the audio under it
             clip_imgs, clip_start = _jb_centre_clip(imgs, bank_clip_frames)
             if bank_ref_noise > 0:
@@ -6419,6 +6422,7 @@ class H3MultishotMemorySampler:
                       _jb_audio_window(wav, sr, clip_start,
                                        clip_imgs.shape[0])))
 
+            _clk.mark("bank")
             # Upscale AFTER the bank has taken its clip: the bank must keep
             # base-resolution reference clips or the conditioning payload -
             # and the VRAM it costs - grows with output_scale for no gain.
@@ -6574,6 +6578,7 @@ class H3MultishotMemorySampler:
                 print("[H3Memory] join %d dressed as VHS glitch" % si,
                       flush=True)
 
+            _clk.mark("join")
             # fp16: the encoder quantises to uint8 downstream, and this
             # timeline is what exhausted host RAM at 6 shots x 243f.
             _clk.mark("analysis")
