@@ -6235,9 +6235,11 @@ class H3MultishotMemorySampler:
                           flush=True)
                 except Exception:
                     pass
+            _clk.mark("post_decode")
             aud = vae_decode_audio(audio_vae, out)
             sr = aud["sample_rate"]
             wav = aud["waveform"]
+            _clk.mark("audio_decode")
 
             if audio_tone_control:
                 # the audio twin of chain flatten: EQ-match every later
@@ -6570,6 +6572,7 @@ class H3MultishotMemorySampler:
 
             # fp16: the encoder quantises to uint8 downstream, and this
             # timeline is what exhausted host RAM at 6 shots x 243f.
+            _clk.mark("analysis")
             if _stream_writer is not None:
                 # streaming: the shot goes to lossless disk NOW and its RAM is
                 # returned; only 1-D statistics stay behind.
@@ -6577,6 +6580,7 @@ class H3MultishotMemorySampler:
             else:
                 frames_parts.append(imgs.cpu().half())
             audio_parts.append((wav if wav.ndim == 3 else wav.unsqueeze(0)).cpu())
+            _clk.mark("to_cpu")
 
         _clk.mark("shot_tail")
         if color_level == "scene" and len(frames_parts) > 1:
