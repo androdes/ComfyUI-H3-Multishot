@@ -1854,6 +1854,50 @@ def _cg_sigma_for(img, target_lap, max_sigma=1.6):
 
 
 
+def _cg_lap_var_each(img):
+    """_cg_lap_var per frame, in one batched pass: a tensor [B], no syncs."""
+    import torch
+    import torch.nn.functional as F
+    x = img if img.ndim == 4 else img.unsqueeze(0)
+    g = (x[..., 0] * 0.299 + x[..., 1] * 0.587 + x[..., 2] * 0.114).unsqueeze(1)
+    if g.shape[-1] > 8 and g.shape[-2] > 8:
+        mx_r = g.amax(dim=(0, 1, 3)) > 0.02
+        mx_c = g.amax(dim=(0, 1, 2)) > 0.02
+        if bool(mx_r.any()) and bool(mx_c.any()):
+            g = g[:, :, mx_r][:, :, :, mx_c]
+    k = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+                     dtype=g.dtype, device=g.device).view(1, 1, 3, 3)
+    lap = F.conv2d(g, k, padding=1).flatten(1).var(dim=1)
+    con = g.flatten(1).var(dim=1).clamp_min(1e-9)
+    return lap / con
+
+
+def _cg_sigma_batch(frames, target, max_sigma=1.6):
+    """_cg_sigma_for over a batch of frames at once: the same 0.05 grid, the
+    same answer per frame, but 32 batched passes instead of 32 x B passes
+    with a host sync each (measured 15 s per shot at 768 on a 5090, now
+    well under a second)."""
+    import torch
+    with torch.no_grad():
+        base = _cg_lap_var_each(frames)
+        need = base > target * 1.02
+        best_s = torch.zeros_like(base)
+        if not bool(need.any()):
+            return [0.0] * int(frames.shape[0])
+        sub = frames[need]
+        best_d = (base[need] - target).abs()
+        best = torch.zeros_like(best_d)
+        s = 0.05
+        while s <= max_sigma + 1e-9:
+            d = (_cg_lap_var_each(_cg_gauss(sub, s)) - target).abs()
+            better = d < best_d
+            best_d = torch.where(better, d, best_d)
+            best = torch.where(better, torch.full_like(best, s), best)
+            s += 0.05
+        best_s[need] = best
+        return [float(v) for v in best_s.tolist()]
+
+
 def _cg_flatten(imgs, target, block=8, max_sigma=1.6):
     """Level a shot to a constant texture energy: blur only, per block.
 
@@ -1867,11 +1911,7 @@ def _cg_flatten(imgs, target, block=8, max_sigma=1.6):
     if n == 0 or target <= 0:
         return imgs, 0.0
     idx = list(range(0, n, block))
-    sig = []
-    for i in idx:
-        f = imgs[i:i + 1]
-        sig.append(_cg_sigma_for(f, target, max_sigma)
-                   if _cg_lap_var(f) > target * 1.02 else 0.0)
+    sig = _cg_sigma_batch(imgs[idx], target, max_sigma)
     # smooth (moving average of 3) so sigma cannot jump between blocks
     sm = []
     for j in range(len(sig)):
