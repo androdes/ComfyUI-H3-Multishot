@@ -80,7 +80,9 @@ def _film_callback(model, steps, x0_output_dict=None):
         if v.ndim != 5:
             return
         try:
-            rows = v[0].permute(1, 0, 2, 3)                # (T, C, H, W)
+            # (T, C, H, W). The latent's time axis runs backwards: the last row is the first frame
+            # (seen 2026-09-24: the film played in reverse), so the rows are flipped before decoding.
+            rows = v[0].permute(1, 0, 2, 3).flip(0)
             frames = [previewer.decode_latent_to_preview(rows[i:i + 1])
                       for i in range(rows.shape[0])]
         except Exception as e:
