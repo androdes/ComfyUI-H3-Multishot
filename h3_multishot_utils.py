@@ -1316,6 +1316,23 @@ def _install_auto_reserve(patcher, model_name):
     _auto_last["model"] = model_name
 
 
+def _live_preview_enter():
+    """The take previews as a film while a pack sampler runs (h3_live_preview)."""
+    try:
+        from . import h3_live_preview
+        h3_live_preview.enter()
+    except Exception:
+        pass
+
+
+def _live_preview_leave():
+    try:
+        from . import h3_live_preview
+        h3_live_preview.leave()
+    except Exception:
+        pass
+
+
 def _auto_measure_begin():
     """Call right before sampling: snapshot the allocator + clock."""
     import time as _t
@@ -2731,7 +2748,7 @@ class H3MultishotSampler:
                     # block joins the list after shot 1 renders)
                     len(voice_blocks),
                     "2p" if two_pass_upscale else ""))
-            _mb = _auto_measure_begin()
+            _mb = _auto_measure_begin(); _live_preview_enter()
             try:
                 if two_pass_upscale:
                     out1, _d1 = ncs.SamplerCustomAdvanced().sample(
@@ -2763,7 +2780,7 @@ class H3MultishotSampler:
                 # record even on interrupt/OOM: the peak up to that moment is
                 # a valid LOWER bound on the pool, and the cache only grows -
                 # an aborted thrashing run should still teach the next one
-                _auto_measure_end(_mb, model, steps=steps)
+                _live_preview_leave(); _auto_measure_end(_mb, model, steps=steps)
 
             lat = out["samples"]
             if getattr(lat, "is_nested", False):
@@ -5986,7 +6003,7 @@ class H3MultishotMemorySampler:
                     len(keyframes), len(ref_blocks),
                     "s" if _spine is not None else "",
                     "2p" if two_pass_upscale else ""))
-            _mb = _auto_measure_begin()
+            _mb = _auto_measure_begin(); _live_preview_enter()
             try:
                 if two_pass_upscale:
                     out1, _d1 = ncs.SamplerCustomAdvanced().sample(
@@ -6022,7 +6039,7 @@ class H3MultishotMemorySampler:
                     out, _d = ncs.SamplerCustomAdvanced().sample(
                         noise, guider, sampler, sigmas, latent)
             finally:
-                _auto_measure_end(_mb, model, steps=steps)
+                _live_preview_leave(); _auto_measure_end(_mb, model, steps=steps)
             _clk.mark("sample")
 
             lat = out["samples"]

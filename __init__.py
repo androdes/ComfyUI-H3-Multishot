@@ -62,6 +62,11 @@ except Exception as _e:                                   # pragma: no cover
     logging.info("[H3-Multishot] LTX upsampler patch skipped (%s)", _e)
 
 try:
+    from . import h3_live_preview      # noqa: F401  (a take previews as a film)
+except Exception as _e:                                   # pragma: no cover
+    logging.info("[H3-Multishot] live film preview not installed (%s)", _e)
+
+try:
     from . import h3_gguf_arch          # noqa: F401
 except Exception as _e:                                   # pragma: no cover
     logging.info("[H3-Multishot] GGUF arch hook not installed (%s). "
