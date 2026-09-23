@@ -48,6 +48,7 @@ for _m in ("h3_keyframes",       # keyframe anchors
            "h3_save_video_fast",   # H3SaveVideoFast: NVENC H.264 write, x264 fallback
            "h3_extend",          # H3ExtendTake: windows from a take length
            "h3_retake",          # H3Retake: redo one time window of a finished clip
+           "h3_memory_route",    # GET /h3/memory: what sits on the card, for the studio's panel
            "ltx25_multishot",
            "h3_qgraft"):       # H3QGraftPatch: donor attention-envelope graft (experimental)   # LTX-2.5 multishot sampler (AV-extend joins)
     _merge(_m)
