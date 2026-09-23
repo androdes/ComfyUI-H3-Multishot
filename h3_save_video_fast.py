@@ -75,48 +75,66 @@ class H3SaveVideoFast:
             options = {"crf": str(int(quality)), "preset": "medium"}
 
         rate = Fraction(fps).limit_denominator(1000)
-        container = av.open(path, "w", format="mp4")
-        vs = container.add_stream(codec, rate=rate, options=options)
-        vs.width, vs.height = w, h
-        vs.pix_fmt = "yuv420p"
-        # Even dimensions are what yuv420p needs; a 32-grid frame already has them.
-        aus = None
-        wave = None
-        if audio is not None and isinstance(audio, dict) and audio.get("waveform") is not None:
-            wave = audio["waveform"]
-            if torch.is_tensor(wave):
-                wave = wave[0] if wave.ndim == 3 else wave
-                wave = wave.detach().float().cpu().numpy()
-            sr = int(audio.get("sample_rate", 48000))
-            ch = int(wave.shape[0]) if wave.ndim == 2 else 1
-            aus = container.add_stream("aac", rate=sr)
-            aus.layout = "stereo" if ch >= 2 else "mono"
+
+        def write(codec, options):
+            container = av.open(path, "w", format="mp4")
+            vs = container.add_stream(codec, rate=rate, options=options)
+            vs.width, vs.height = w, h
+            vs.pix_fmt = "yuv420p"
+            # Even dimensions are what yuv420p needs; a 32-grid frame already has them.
+            aus = None
+            wave = None
+            if audio is not None and isinstance(audio, dict) and audio.get("waveform") is not None:
+                wave = audio["waveform"]
+                if torch.is_tensor(wave):
+                    wave = wave[0] if wave.ndim == 3 else wave
+                    wave = wave.detach().float().cpu().numpy()
+                sr = int(audio.get("sample_rate", 48000))
+                ch = int(wave.shape[0]) if wave.ndim == 2 else 1
+                aus = container.add_stream("aac", rate=sr)
+                aus.layout = "stereo" if ch >= 2 else "mono"
+            try:
+                for i in range(n):
+                    frame = (images[i].detach().float().clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+                    vf = av.VideoFrame.from_ndarray(frame, format="rgb24")
+                    for pkt in vs.encode(vf):
+                        container.mux(pkt)
+                for pkt in vs.encode():
+                    container.mux(pkt)
+                if aus is not None and wave is not None:
+                    if wave.ndim == 1:
+                        wave = wave[None, :]
+                    if aus.layout.name == "stereo" and wave.shape[0] == 1:
+                        wave = np.repeat(wave, 2, axis=0)
+                    if aus.layout.name == "mono" and wave.shape[0] > 1:
+                        wave = wave[:1]
+                    af = av.AudioFrame.from_ndarray(np.ascontiguousarray(wave.astype(np.float32)),
+                                                    format="fltp", layout=aus.layout.name)
+                    af.sample_rate = int(audio.get("sample_rate", 48000))
+                    af.pts = 0
+                    for pkt in aus.encode(af):
+                        container.mux(pkt)
+                    for pkt in aus.encode():
+                        container.mux(pkt)
+            finally:
+                container.close()
 
         try:
-            for i in range(n):
-                frame = (images[i].detach().float().clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-                vf = av.VideoFrame.from_ndarray(frame, format="rgb24")
-                for pkt in vs.encode(vf):
-                    container.mux(pkt)
-            for pkt in vs.encode():
-                container.mux(pkt)
-            if aus is not None and wave is not None:
-                if wave.ndim == 1:
-                    wave = wave[None, :]
-                if aus.layout.name == "stereo" and wave.shape[0] == 1:
-                    wave = np.repeat(wave, 2, axis=0)
-                if aus.layout.name == "mono" and wave.shape[0] > 1:
-                    wave = wave[:1]
-                af = av.AudioFrame.from_ndarray(np.ascontiguousarray(wave.astype(np.float32)),
-                                                format="fltp", layout=aus.layout.name)
-                af.sample_rate = int(audio.get("sample_rate", 48000))
-                af.pts = 0
-                for pkt in aus.encode(af):
-                    container.mux(pkt)
-                for pkt in aus.encode():
-                    container.mux(pkt)
-        finally:
-            container.close()
+            write(codec, options)
+        except Exception as e:
+            # An ffmpeg that has NVENC on a card that will not open it: a rented container without the
+            # driver's video capability says "OpenEncodeSessionEx failed: unsupported device" at the first
+            # frame, after the whole take was sampled. x264 then, and the take is not lost.
+            if codec != "libx264":
+                print("[H3SaveVideoFast] %s refused (%s) - libx264 instead" % (codec, str(e).splitlines()[0][:160]), flush=True)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                codec = "libx264"
+                write(codec, {"crf": str(int(quality)), "preset": "medium"})
+            else:
+                raise
         size_mb = os.path.getsize(path) / 1e6
         print("[H3SaveVideoFast] %s: %d frames, %s, %.1f MB" % (file, n, codec, size_mb), flush=True)
         return {"ui": {"images": [{"filename": file, "subfolder": subfolder, "type": "output"}]}}
