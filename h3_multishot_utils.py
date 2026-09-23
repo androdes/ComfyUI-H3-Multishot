@@ -3711,6 +3711,14 @@ class H3MultishotMemorySampler:
                            "swapping them, and reuses conditioning and "
                            "reference latents across runs. Off for real "
                            "takes."}),
+            "tiny_decode": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Decode the frames with the 9 MB tiny decoder "
+                           "(taeh3) instead of the video VAE: about a second "
+                           "where the VAE takes four, and texture smeared. "
+                           "For a rough take that only asks whether the idea "
+                           "holds; never for a clip to keep. Needs "
+                           "taeh3.safetensors in models/vae_approx."}),
             "start_image": ("IMAGE", {
                 "tooltip": "Optional identity reference image. NOT a first "
                            "frame - this node has no keyframe."}),
@@ -4366,7 +4374,8 @@ class H3MultishotMemorySampler:
             pin_noise_ramp=False, auto_chunk_ffn=False,
             sampler_2="(off)", sampler_2_at=0.40,
             voice_ref_2=None, voice_ref_3=None,
-            prompt=None, extra_pnginfo=None, live_glimpse=False):
+            prompt=None, extra_pnginfo=None, live_glimpse=False,
+            tiny_decode=False):
         _clk = _StageClock("live" if live_glimpse else "take")
         # Keep the hidden PROMPT before anything can shadow it: the shot loop
         # rebinds `prompt` to this shot's conditioning TEXT, so by finalize()
@@ -6048,10 +6057,13 @@ class H3MultishotMemorySampler:
                     print("[H3Memory] H3 latent upscale FAILED (%s) - "
                           "base-res decode kept" % _lu_e, flush=True)
                     imgs = video_vae.decode(lat)
-            elif live_glimpse:
+            elif live_glimpse or tiny_decode:
                 # Draft frames from the 9 MB tiny decoder: the glimpse graph
                 # reads video_latents through H3TAEDecode anyway, so the
                 # full video VAE (1.8 s and 5 GB) has nothing to add here.
+                # tiny_decode asks for the same on a full take that is only
+                # a rough look at the idea (4.1 s of VAE on a 26 s take,
+                # measured 2026-09-23 on a 5090).
                 try:
                     from .h3_tae_decode import H3TAEDecode as _TAE
                     imgs = _TAE().decode({"samples": lat}, "taeh3.safetensors")[0]
