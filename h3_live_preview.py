@@ -36,9 +36,9 @@ try:
 except Exception:                                          # pragma: no cover
     latent_preview = None
 
-# Video frames per latent row: (1, 4, 4, 4, 4) for H3 -> about 4 per row at
-# 24 fps, so a row is shown for a sixth of a second, as SwarmUI does.
-FRAME_MS = int(1000 / 6)
+# A 10 s take at 24 fps is 72 latent rows (measured 2026-09-23: 243 frames
+# -> 72 rows), so a row stands for 140 ms: the film plays at the take's pace.
+FRAME_MS = 140
 WEBP_TYPE = 3
 
 _depth = 0
