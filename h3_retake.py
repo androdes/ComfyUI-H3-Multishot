@@ -14,6 +14,7 @@ grid, audio [1,32,2,Ta] at 40 latent fps (time is the LAST axis on the audio sid
 real difference from the LTX port). H3 samples with a BasicGuider at cfg 1, so there is no
 negative branch; wire the same SAMPLER and SIGMAS the clip was rendered with.
 """
+import math
 import time
 
 import torch
@@ -72,6 +73,12 @@ class H3Retake:
             "sampler": ("SAMPLER", {"tooltip": "The sampler the clip was rendered with (euler)."}),
             "sigmas": ("SIGMAS", {"tooltip": "The schedule the clip was rendered with (beta, 10-12 steps; "
                                   "wire the same sigma-shift chain as the render canvas)."}),
+        }, "optional": {
+            "context_seconds": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 30.0, "step": 0.5, "tooltip":
+                                "Only this much of the clip on either side of the window is sampled with it, "
+                                "the rest is never touched: a 3 s retake of a 20 s clip costs 7 s of sampling, "
+                                "not 20. 0 = the whole clip, as before (measured 2026-09-24 on a 5090: 65 s -> "
+                                "about 25 s for that case)."}),
         }}
 
     RETURN_TYPES = ("IMAGE", "AUDIO", "STRING")
@@ -90,31 +97,54 @@ class H3Retake:
         return a, b
 
     def run(self, model, clip, video_vae, audio_vae, images, audio, prompt,
-            start_seconds, end_seconds, mode, seed, sampler, sigmas):
+            start_seconds, end_seconds, mode, seed, sampler, sigmas, context_seconds=2.0):
         if end_seconds <= start_seconds:
             raise ValueError("H3 Retake: end_seconds must be after start_seconds.")
         u, mmh3 = _mm_utils()
         t0 = time.time()
         do_video = not mode.startswith("audio only")
         do_audio = not mode.startswith("video only")
+        fps = float(mmh3.FPS)
 
-        # ---- frames onto H3's 17k+5 grid, canvas to /32 (a finished render already is)
+        # ---- the stretch sampled: the window plus its context on either side, on H3's 17k+5 grid. The
+        # rest of the clip is never encoded, sampled or decoded - it is spliced back as it was.
         frames = images[..., :3]
         n_px = frames.shape[0]
-        keep = 5 + ((n_px - 5) // 17) * 17 if n_px >= 22 else n_px
-        if keep != n_px:
-            print("[H3Retake] %d frames -> %d (H3's 17k+5 grid; the tail beyond the grid is "
-                  "re-appended untouched after the retake)" % (n_px, keep), flush=True)
-        grid_frames = frames[:keep]
+        a0, a1 = 0, n_px
+        if context_seconds > 0:
+            a0 = max(0, int(math.floor((start_seconds - context_seconds) * fps)))
+            a1 = min(n_px, int(math.ceil((end_seconds + context_seconds) * fps)))
+            need = max(22, a1 - a0)
+            length = 5 + 17 * int(math.ceil((need - 5) / 17.0))
+            a1 = min(n_px, a0 + length)
+            a0 = max(0, a1 - length)
+        sub = frames[a0:a1]
+        n_sub = sub.shape[0]
+        keep = 5 + ((n_sub - 5) // 17) * 17 if n_sub >= 22 else n_sub
+        if keep != n_sub:
+            print("[H3Retake] %d frames -> %d (H3's 17k+5 grid; what lies beyond the grid is "
+                  "kept untouched)" % (n_sub, keep), flush=True)
+        grid_frames = sub[:keep]
         h, w = grid_frames.shape[1], grid_frames.shape[2]
-        if h % 32 or w % 32:
+        resized = h % 32 or w % 32
+        if resized:
             tw, th = max(32, round(w / 32) * 32), max(32, round(h / 32) * 32)
             grid_frames = mmh3._resize(grid_frames, tw, th, "disabled")
-        total_seconds = keep / float(mmh3.FPS)
+        total_seconds = keep / fps
+        offset = a0 / fps
+        # the window, in the stretch's own time
+        start_in = max(0.0, start_seconds - offset)
+        end_in = min(total_seconds, end_seconds - offset)
+        if a0 > 0 or a0 + keep < n_px:
+            print("[H3Retake] sampling frames %d-%d of %d (%.1f-%.1f s with %.1f s of context); the rest is "
+                  "spliced back as it was" % (a0, a0 + keep, n_px, offset, offset + total_seconds, context_seconds), flush=True)
 
         # ---- encode both sides to raw latents
         vz = video_vae.encode(grid_frames)                          # [1, 24, T, h/16, w/16]
-        wav, _sr = u._wav_for_vae(audio_vae, audio, "retake audio")
+        wav_all, vae_sr = u._wav_for_vae(audio_vae, audio, "retake audio")
+        s0 = int(round(offset * vae_sr))
+        s1 = int(round((offset + total_seconds) * vae_sr))
+        wav = wav_all[..., s0:s1]
         az = audio_vae.encode(wav.movedim(1, -1))                   # [1, 32, 2, Ta] - time LAST
         # audio no longer than the video window
         ta_want = round(total_seconds * mmh3.AUDIO_LATENT_FPS)
@@ -124,11 +154,11 @@ class H3Retake:
         mv, ma = torch.zeros_like(vz), torch.zeros_like(az)
         vw = aw = None
         if do_video:
-            i, j = self._window(vz.shape[2], total_seconds, start_seconds, end_seconds)
+            i, j = self._window(vz.shape[2], total_seconds, start_in, end_in)
             mv[:, :, i:j] = 1.0
             vw = (i, j, vz.shape[2])
         if do_audio:
-            i, j = self._window(az.shape[-1], total_seconds, start_seconds, end_seconds)
+            i, j = self._window(az.shape[-1], total_seconds, start_in, end_in)
             ma[..., i:j] = 1.0
             aw = (i, j, az.shape[-1])
 
@@ -142,20 +172,47 @@ class H3Retake:
         noise = ncs.RandomNoise().get_noise(seed)[0]
         out, _denoised = ncs.SamplerCustomAdvanced().sample(noise, guider, sampler, sigmas, latent)
 
-        # ---- decode
+        # ---- decode, then splice the stretch back into the clip: the frames and the sound outside it are
+        # the originals, bit for bit; inside it, the retake.
         lat = out["samples"]
         if getattr(lat, "is_nested", False):
             lat = lat.unbind()[0]
         imgs = video_vae.decode(lat)
         if imgs.ndim == 5:
             imgs = imgs.reshape(-1, imgs.shape[-3], imgs.shape[-2], imgs.shape[-1])
+        if resized:
+            imgs = mmh3._resize(imgs, w, h, "disabled")
+        imgs = imgs[:keep].cpu()
+        if do_video:
+            imgs = torch.cat([frames[:a0].cpu(), imgs, frames[a0 + keep:].cpu()], 0)
+        else:
+            imgs = frames.cpu()
         from comfy_extras.nodes_audio import vae_decode_audio
-        aud = vae_decode_audio(audio_vae, out)
-        if keep != n_px:                                            # re-append the off-grid tail untouched
-            imgs = torch.cat([imgs.cpu(), frames[keep:].cpu()], 0)
+        if do_audio:
+            dec = vae_decode_audio(audio_vae, out)
+            out_sr = int(dec["sample_rate"])
+            whole = wav_all
+            if out_sr != vae_sr:
+                import torchaudio
+                whole = torchaudio.functional.resample(wav_all, vae_sr, out_sr)
+            d0 = int(round(offset * out_sr))
+            d1 = int(round((offset + total_seconds) * out_sr))
+            piece = dec["waveform"][..., :d1 - d0].cpu()
+            # the decoder's level is its own (normalised on the way out): the piece is brought to the level the
+            # original has in the same stretch, so nothing jumps at the splice
+            ref = whole[..., d0:d1].cpu()
+            n = min(piece.shape[-1], ref.shape[-1])
+            if n > 0:
+                gain = (ref[..., :n].pow(2).mean().sqrt() / piece[..., :n].pow(2).mean().sqrt().clamp_min(1e-6)).clamp(0.05, 20.0)
+                piece = piece * gain
+            if piece.shape[-1] < d1 - d0:
+                piece = torch.nn.functional.pad(piece, (0, d1 - d0 - piece.shape[-1]))
+            aud = {"waveform": torch.cat([whole[..., :d0].cpu(), piece, whole[..., d1:].cpu()], -1), "sample_rate": out_sr}
+        else:
+            aud = {"waveform": wav_all.cpu(), "sample_rate": vae_sr}
 
-        info = ("retake %.1f-%.1f s of a %.1f s clip | %s | video slots %s | audio slots %s | %.0f s"
-                % (start_seconds, end_seconds, n_px / float(mmh3.FPS), mode,
+        info = ("retake %.1f-%.1f s of a %.1f s clip | %s | sampled %.1f-%.1f s | video slots %s | audio slots %s | %.0f s"
+                % (start_seconds, end_seconds, n_px / fps, mode, offset, offset + total_seconds,
                    ("%d-%d of %d" % vw) if vw else "frozen",
                    ("%d-%d of %d" % aw) if aw else "frozen", time.time() - t0))
         print("[H3Retake] " + info, flush=True)
