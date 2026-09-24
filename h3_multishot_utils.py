@@ -1316,6 +1316,43 @@ def _install_auto_reserve(patcher, model_name):
     _auto_last["model"] = model_name
 
 
+def _comfy_quant_gguf(path):
+    """A GGUF that only boxes ComfyUI's own quantized layers - int8_tensorwise
+    with convrot, as the MiniMax H3 Turbo files ship (I8 weights, F32
+    weight_scale, the layer's config under comfy.gguf.quant.<name>) - loaded
+    the way ComfyUI loads the same layers from a safetensors. ComfyUI-GGUF
+    cannot: it knows llama quants, and falls to numpy for I8, which has no
+    dequantizer ("Dequantization for I8 is not yet implemented", 2026-09-24,
+    on the 3060). Returns None for an ordinary GGUF (Q4_0, Q5_0...), which
+    stays with ComfyUI-GGUF."""
+    import warnings
+    import torch
+    import gguf
+    import comfy.sd
+    r = gguf.GGUFReader(path)
+    prefix = "comfy.gguf.quant."
+    conf = {k[len(prefix):]: bytes(f.parts[f.data[0]]).decode("utf-8")
+            for k, f in r.fields.items() if k.startswith(prefix)}
+    if not conf:
+        return None
+    sd = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")        # read-only memmap: no copy here
+        for t in r.tensors:
+            sd[t.name] = torch.from_numpy(t.data)
+            if t.name in conf:
+                sd[t.name[:-len(".weight")] + ".comfy_quant"] = torch.tensor(
+                    list(conf[t.name].encode("utf-8")), dtype=torch.uint8)
+    print("[H3ModelLoader] %s: %d int8 layers in ComfyUI's own format, "
+          "loaded natively (not through ComfyUI-GGUF)"
+          % (path.split("/")[-1], len(conf)), flush=True)
+    model = comfy.sd.load_diffusion_model_state_dict(sd)
+    if model is None:
+        raise RuntimeError("[H3ModelLoader] could not detect the model in %s" % path)
+    model.cached_patcher_init = (_comfy_quant_gguf, (path,))
+    return model
+
+
 def _live_preview_enter():
     """The take previews as a film while a pack sampler runs (h3_live_preview)."""
     try:
@@ -1682,6 +1719,10 @@ class H3ModelLoaderAny:
                     "saved on another machine remembers a name your models "
                     "folder does not have)." % (model_name, ", ".join(_roots)))
         if model_name.lower().endswith(".gguf"):
+            _path = _found or _hit
+            _native = _comfy_quant_gguf(_path)
+            if _native is not None:
+                return (_native,)
             # resolve the live UnetLoaderGGUF from the global registry -
             # custom node packages load under mangled module names, so the
             # registry is the only stable handle.
